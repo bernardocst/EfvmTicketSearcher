@@ -3,7 +3,7 @@ Monitor de disponibilidade - Trem de Passageiros EFVM (Vale)
  
 Uso:
     pip install requests
-    python efvmTicketWatcher.py
+    python efvmTicketSearcher.py
  
 O app pergunta estacao de origem/destino, data, tipo de viagem (so ida,
 so volta ou ida e volta), classe e passageiros, e depois consulta a
