@@ -40,4 +40,5 @@ Press `Ctrl+C` to stop the monitor.
 
 ## Disclaimer
 
-This project is for personal use and educational purposes. It is not affiliated with or endorsed by Vale.
+This project is for personal use and educational purposes. It is not affiliated with or endorsed by Vale!
+By Bernardo Costa — [@bernardocst](https://github.com/bernardocst)
