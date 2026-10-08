@@ -236,9 +236,9 @@ def escolher_de_lista(titulo, opcoes):
     titulo_secao(titulo)
     for i, (_, nome) in enumerate(itens, 1):
         print(f"  {i:2d}) {nome}")
-    print(f"   {TECLA_VOLTAR}) Voltar")
+    print(f"  {TECLA_VOLTAR}) Voltar")
     while True:
-        txt = input("\nDigite o numero: ").strip()
+        txt = input("Digite o numero: ").strip()
         if txt.upper() == TECLA_VOLTAR:
             return None
         if txt.isdigit() and 1 <= int(txt) <= len(itens):
@@ -251,22 +251,22 @@ def pedir_data(rotulo, minimo=None):
     primeiro = max(hoje + timedelta(days=1), minimo or hoje)
     ultimo = hoje + timedelta(days=DIAS_LIBERACAO_VENDA)
     titulo_secao(rotulo.upper())
-    print(f"  Datas aceitas: {primeiro:%d/%m/%Y} ate {ultimo:%d/%m/%Y}")
+    print(f"  Periodo aceito: {primeiro:%d/%m/%Y} a {ultimo:%d/%m/%Y}")
     print("  (nao ha venda para o mesmo dia da viagem)")
-    print(f"  {TECLA_VOLTAR}) Voltar")
+    print(f"  {TECLA_VOLTAR} = voltar")
     while True:
-        txt = input("\nData (DD/MM/AAAA): ").strip()
+        txt = input("Data (DD/MM/AAAA): ").strip()
         if txt.upper() == TECLA_VOLTAR:
             return None
         try:
             d = datetime.strptime(txt, "%d/%m/%Y").date()
         except ValueError:
-            print("Formato invalido. Use DD/MM/AAAA.")
+            print("  Formato invalido. Use DD/MM/AAAA.")
             continue
         if d < primeiro:
-            print(f"A data deve ser a partir de {primeiro:%d/%m/%Y}.")
+            print(f"  A data deve ser a partir de {primeiro:%d/%m/%Y}.")
         elif d > ultimo:
-            print(f"A venda so abre ate {ultimo:%d/%m/%Y}.")
+            print(f"  A venda so abre ate {ultimo:%d/%m/%Y}.")
         else:
             return d
  
@@ -274,7 +274,7 @@ def pedir_data(rotulo, minimo=None):
 def pedir_inteiro(rotulo, minimo, maximo, permitir_voltar=True):
     sufixo = f", {TECLA_VOLTAR}=voltar" if permitir_voltar else ""
     while True:
-        txt = input(f"\n{rotulo} ({minimo}-{maximo}{sufixo}): ").strip()
+        txt = input(f"{rotulo} ({minimo}-{maximo}{sufixo}): ").strip()
         if permitir_voltar and txt.upper() == TECLA_VOLTAR:
             return None
         if txt.isdigit() and minimo <= int(txt) <= maximo:
@@ -291,7 +291,7 @@ def escolher_classes():
     print("  4) Cadeirante")
     print(f"  {TECLA_VOLTAR}) Voltar")
     while True:
-        txt = input("\nEscolha: ").strip()
+        txt = input("Escolha: ").strip()
         if txt.upper() == TECLA_VOLTAR:
             return None
         if txt.isdigit() and 1 <= int(txt) <= 4:
@@ -485,7 +485,6 @@ def anunciar(titulo, itens, qtd, rodape=None):
             print(f"  {rodape}")
         print(f"  Compre em: {URL_COMPRA}")
         print(LINHA_DUPLA)
-        print()
     bipar()
  
  
@@ -646,20 +645,18 @@ def iniciar_monitoramento(busca):
     for t in threads:
         t.join(timeout=25)
  
-    titulo_secao("BUSCA ENCERRADA")
     mensagens = {
-        "unica": "Passagem encontrada.",
-        "conjunto": "Ida e volta encontradas.",
-        "interrompida": "Busca interrompida por voce.",
-        "diagnostico": "Modo diagnostico concluido.",
+        "unica": "passagem encontrada.",
+        "conjunto": "ida e volta encontradas.",
+        "interrompida": "interrompida por voce.",
+        "diagnostico": "modo diagnostico concluido.",
     }
-    print(f"  {mensagens.get(busca.motivo, 'Busca encerrada.')}")
+    print(f"\nBusca encerrada: {mensagens.get(busca.motivo, 'fim da busca.')}")
  
  
 def perguntar_nova_busca():
-    print()
     while True:
-        r = input("Deseja fazer uma nova busca? (S = nova busca / N = encerrar programa): ").strip().upper()
+        r = input("\nDeseja fazer uma nova busca? (S = nova busca / N = encerrar programa): ").strip().upper()
         if r in ("S", "SIM"):
             return True
         if r in ("N", "NAO"):
