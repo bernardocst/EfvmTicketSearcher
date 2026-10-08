@@ -3,7 +3,7 @@ Monitor de disponibilidade - Trem de Passageiros EFVM (Vale)
  
 Uso:
     pip install requests
-    python monitor_trem_efvm.py
+    python efvmTicketWatcher.py
  
 O app pergunta estacao de origem/destino, data, tipo de viagem (so ida,
 so volta ou ida e volta), classe e passageiros, e depois consulta a
@@ -43,7 +43,7 @@ HEADERS = {
 }
  
 # ----------------------------------------------------------------------
-# DADOS ESTACOES
+# DADOS JA CONHECIDOS (obtidos das respostas que voce enviou)
 # ----------------------------------------------------------------------
 ESTACOES = {
     7166: "Aimores",
