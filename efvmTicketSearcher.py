@@ -15,6 +15,7 @@ O endpoint (pesquisaPassagem) e o payload foram copiados do proprio site.
 import json
 import sys
 import time
+import threading
 from datetime import date, datetime, timedelta, timezone
  
 import requests
@@ -41,6 +42,12 @@ HEADERS = {
     "Referer": "https://tremdepassageiros.vale.com/sgpweb/portal/index.html",
     "User-Agent": "Mozilla/5.0 (monitor pessoal de disponibilidade)",
 }
+
+# Tecla usada para voltar durante o preenchimento dos dados.
+TECLA_VOLTAR = "V"
+
+# Lock para impedir que duas threads escrevam no terminal ao mesmo tempo.
+PRINT_LOCK = threading.Lock()
  
 # ----------------------------------------------------------------------
 # DADOS JA CONHECIDOS (obtidos das respostas que voce enviou)
@@ -179,13 +186,17 @@ def interpretar_resposta(dados, qtd, origem, destino, classe):
 # INTERFACE (menus)
 # ----------------------------------------------------------------------
 def escolher_de_lista(titulo, opcoes):
-    """opcoes: dict id -> nome. Retorna o id escolhido."""
+    """opcoes: dict id -> nome. Retorna o id escolhido.
+    Retorna None quando o usuario escolhe voltar."""
     itens = sorted(opcoes.items(), key=lambda kv: kv[1])
     print(f"\n{titulo}")
     for i, (_, nome) in enumerate(itens, 1):
         print(f"  {i:2d}) {nome}")
+    print(f"  {TECLA_VOLTAR}) Voltar")
     while True:
         txt = input("Digite o numero: ").strip()
+        if txt.upper() == TECLA_VOLTAR:
+            return None
         if txt.isdigit() and 1 <= int(txt) <= len(itens):
             return itens[int(txt) - 1][0]
         print("Opcao invalida.")
@@ -197,8 +208,11 @@ def pedir_data(rotulo, minimo=None):
     ultimo = hoje + timedelta(days=DIAS_LIBERACAO_VENDA)
     print(f"\n{rotulo} (de {primeiro:%d/%m/%Y} ate {ultimo:%d/%m/%Y})")
     print("Obs.: nao ha venda para o mesmo dia da viagem.")
+    print(f"Digite {TECLA_VOLTAR} para voltar.")
     while True:
         txt = input("Data (DD/MM/AAAA): ").strip()
+        if txt.upper() == TECLA_VOLTAR:
+            return None
         try:
             d = datetime.strptime(txt, "%d/%m/%Y").date()
         except ValueError:
@@ -214,7 +228,9 @@ def pedir_data(rotulo, minimo=None):
  
 def pedir_inteiro(rotulo, minimo, maximo):
     while True:
-        txt = input(f"{rotulo} ({minimo}-{maximo}): ").strip()
+        txt = input(f"{rotulo} ({minimo}-{maximo}, {TECLA_VOLTAR}=voltar): ").strip()
+        if txt.upper() == TECLA_VOLTAR:
+            return None
         if txt.isdigit() and minimo <= int(txt) <= maximo:
             return int(txt)
         print("Valor invalido.")
@@ -227,8 +243,15 @@ def escolher_classes():
     print("  2) Executiva")
     print("  3) Ambas (Economica + Executiva)")
     print("  4) Cadeirante")
-    op = pedir_inteiro("Escolha", 1, 4)
-    return {1: [43], 2: [44], 3: [43, 44], 4: [45]}[op]
+    print(f"  {TECLA_VOLTAR}) Voltar")
+    while True:
+        txt = input("Escolha: ").strip()
+        if txt.upper() == TECLA_VOLTAR:
+            return None
+        if txt.isdigit() and 1 <= int(txt) <= 4:
+            op = int(txt)
+            return {1: [43], 2: [44], 3: [43, 44], 4: [45]}[op]
+        print("Opcao invalida.")
  
  
 def montar_trechos():
@@ -237,34 +260,171 @@ def montar_trechos():
     print(" Monitor de disponibilidade - EFVM (Vale)")
     print("=" * 60)
  
-    print("\nTipo de viagem:")
-    print("  1) So ida")
-    print("  2) Ida e volta")
-    tipo = pedir_inteiro("Escolha", 1, 2)
- 
-    # Origem e destino sao perguntados uma unica vez.
-    # Na volta, o sentido e invertido automaticamente (destino -> origem).
-    origem = escolher_de_lista("ESTACAO DE ORIGEM (partida):", ESTACOES)
-    restantes = {k: v for k, v in ESTACOES.items() if k != origem}
-    destino = escolher_de_lista("ESTACAO DE DESTINO (chegada):", restantes)
- 
-    classes = escolher_classes()
-    qtd = pedir_inteiro("Numero de passageiros", 1, 8)
- 
-    trechos = []
-    d1 = pedir_data("Data da IDA")
-    trechos.append(("IDA", origem, destino, d1))
-    if tipo == 2:
-        d2 = pedir_data("Data da VOLTA", minimo=d1)
-        trechos.append(("VOLTA", destino, origem, d2))
- 
-    print("\n--- Resumo ---")
-    for nome, o, d_, dt in trechos:
-        print(f"{nome}: {ESTACOES[o]} -> {ESTACOES[d_]} em {dt:%d/%m/%Y}")
-    print(f"Classe(s): {' + '.join(CLASSES[c] for c in classes)} | Passageiros: {qtd}")
-    print(f"Consulta a cada {INTERVALO_SEGUNDOS}s. Ctrl+C para parar.")
-    input("Aperte ENTER para iniciar... ")
-    return trechos, classes, qtd
+    # Os dados ficam armazenados para permitir voltar sem reiniciar.
+    tipo = None
+    origem = None
+    destino = None
+    classes = None
+    qtd = None
+    d1 = None
+    d2 = None
+
+    etapa = 0
+
+    while True:
+
+        # --------------------------------------------------------------
+        # ETAPA 0 - TIPO DE VIAGEM
+        # --------------------------------------------------------------
+        if etapa == 0:
+            print("\nTipo de viagem:")
+            print("  1) So ida")
+            print("  2) Ida e volta")
+            tipo_novo = pedir_inteiro("Escolha", 1, 2)
+
+            if tipo_novo is None:
+                continue
+
+            tipo = tipo_novo
+
+            # Se mudou de ida e volta para somente ida, elimina a volta.
+            if tipo == 1:
+                d2 = None
+
+            etapa = 1
+            continue
+
+        # --------------------------------------------------------------
+        # ETAPA 1 - ORIGEM
+        # --------------------------------------------------------------
+        if etapa == 1:
+            origem_nova = escolher_de_lista(
+                "ESTACAO DE ORIGEM (partida):",
+                ESTACOES
+            )
+
+            if origem_nova is None:
+                etapa = 0
+                continue
+
+            origem = origem_nova
+
+            # Se a origem mudou, o destino anterior pode continuar valido,
+            # mas ele precisa ser diferente da nova origem.
+            if destino == origem:
+                destino = None
+
+            etapa = 2
+            continue
+
+        # --------------------------------------------------------------
+        # ETAPA 2 - DESTINO
+        # --------------------------------------------------------------
+        if etapa == 2:
+            restantes = {k: v for k, v in ESTACOES.items() if k != origem}
+
+            destino_novo = escolher_de_lista(
+                "ESTACAO DE DESTINO (chegada):",
+                restantes
+            )
+
+            if destino_novo is None:
+                etapa = 1
+                continue
+
+            destino = destino_novo
+            etapa = 3
+            continue
+
+        # --------------------------------------------------------------
+        # ETAPA 3 - CLASSE
+        # --------------------------------------------------------------
+        if etapa == 3:
+            classes_novas = escolher_classes()
+
+            if classes_novas is None:
+                etapa = 2
+                continue
+
+            classes = classes_novas
+            etapa = 4
+            continue
+
+        # --------------------------------------------------------------
+        # ETAPA 4 - PASSAGEIROS
+        # --------------------------------------------------------------
+        if etapa == 4:
+            qtd_novo = pedir_inteiro("Numero de passageiros", 1, 8)
+
+            if qtd_novo is None:
+                etapa = 3
+                continue
+
+            qtd = qtd_novo
+            etapa = 5
+            continue
+
+        # --------------------------------------------------------------
+        # ETAPA 5 - DATA DA IDA
+        # --------------------------------------------------------------
+        if etapa == 5:
+            d1_nova = pedir_data("Data da IDA")
+
+            if d1_nova is None:
+                etapa = 4
+                continue
+
+            d1 = d1_nova
+
+            # Caso a data da volta anterior tenha ficado menor que a nova
+            # data da ida, ela sera solicitada novamente.
+            if d2 is not None and d2 < d1:
+                d2 = None
+
+            if tipo == 2:
+                etapa = 6
+            else:
+                etapa = 7
+            continue
+
+        # --------------------------------------------------------------
+        # ETAPA 6 - DATA DA VOLTA
+        # --------------------------------------------------------------
+        if etapa == 6:
+            d2_nova = pedir_data("Data da VOLTA", minimo=d1)
+
+            if d2_nova is None:
+                etapa = 5
+                continue
+
+            d2 = d2_nova
+            etapa = 7
+            continue
+
+        # --------------------------------------------------------------
+        # ETAPA 7 - RESUMO / CONFIRMACAO
+        # --------------------------------------------------------------
+        if etapa == 7:
+            trechos = []
+            trechos.append(("IDA", origem, destino, d1))
+
+            if tipo == 2:
+                trechos.append(("VOLTA", destino, origem, d2))
+
+            print("\n--- Resumo ---")
+            for nome, o, d_, dt in trechos:
+                print(f"{nome}: {ESTACOES[o]} -> {ESTACOES[d_]} em {dt:%d/%m/%Y}")
+            print(f"Classe(s): {' + '.join(CLASSES[c] for c in classes)} | Passageiros: {qtd}")
+            print(f"Consulta a cada {INTERVALO_SEGUNDOS}s. Ctrl+C para parar.")
+            print(f"Digite {TECLA_VOLTAR} para voltar e corrigir os dados.")
+            
+            confirmacao = input("Aperte ENTER para iniciar... ").strip()
+
+            if confirmacao.upper() == TECLA_VOLTAR:
+                etapa = 6 if tipo == 2 else 5
+                continue
+
+            return trechos, classes, qtd, tipo
  
  
 # ----------------------------------------------------------------------
@@ -296,94 +456,221 @@ def bipar(repeticoes=3):
 def anunciar_vaga(trecho, classe, qtd, resumo):
     nome, origem, destino, data_viagem = trecho
     linha = "=" * 60
-    print()
-    print(linha)
-    print("  PASSAGEM ENCONTRADA!")
-    print(linha)
-    print(f"  Trecho    : {nome} - {ESTACOES[origem]} -> {ESTACOES[destino]}")
-    print(f"  Data      : {data_viagem:%d/%m/%Y}")
-    print(f"  Classe    : {CLASSES[classe]}  |  Passageiros: {qtd}")
-    print(f"  Encontrada: {datetime.now():%d/%m/%Y as %H:%M:%S}")
-    print(linha)
-    print("  Opcoes:")
-    print(resumo)
-    print(linha)
-    print("  Corra para comprar:")
-    print("  https://tremdepassageiros.vale.com/sgpweb/portal/index.html#/home")
-    print(linha)
-    print()
+
+    with PRINT_LOCK:
+        print()
+        print(linha)
+        print("  PASSAGEM ENCONTRADA!")
+        print(linha)
+        print(f"  Trecho    : {nome} - {ESTACOES[origem]} -> {ESTACOES[destino]}")
+        print(f"  Data      : {data_viagem:%d/%m/%Y}")
+        print(f"  Classe    : {CLASSES[classe]}  |  Passageiros: {qtd}")
+        print(f"  Encontrada: {datetime.now():%d/%m/%Y as %H:%M:%S}")
+        print(linha)
+        print("  Opcoes:")
+        print(resumo)
+        print(linha)
+        print("  Corra para comprar:")
+        print("  https://tremdepassageiros.vale.com/sgpweb/portal/index.html#/home")
+        print(linha)
+        print()
+
     bipar()
- 
- 
-def main():
-    trechos, classes, qtd = montar_trechos()
+
+
+# ----------------------------------------------------------------------
+# MONITORAMENTO INDIVIDUAL
+# ----------------------------------------------------------------------
+def monitorar_trecho(trecho, classes, qtd):
+    """Monitora continuamente um trecho.
+
+    Esta funcao e executada em uma thread propria quando a viagem
+    escolhida for ida e volta.
+    """
+
+    nome, o, d, dt = trecho
     sessao = requests.Session()
     sessao.headers.update(HEADERS)
- 
-    pendentes = list(trechos)
+
     espera = INTERVALO_SEGUNDOS
     tentativa = 0
- 
-    try:
-        while pendentes:
-            tentativa += 1
-            falhou = False
- 
-            for trecho in list(pendentes):
-                nome, o, d, dt = trecho
-                achou = False
- 
-                for classe in classes:
-                    agora = datetime.now().strftime("%H:%M:%S")
-                    rotulo = (f"{nome} {ESTACOES[o]} -> {ESTACOES[d]} "
-                              f"{dt:%d/%m} [{CLASSES[classe]}]")
-                    try:
-                        dados = consultar(sessao, trecho, classe, qtd)
-                    except requests.HTTPError as e:
-                        falhou = True
-                        print(f"[{agora}] {rotulo}: erro HTTP {e.response.status_code}")
-                        time.sleep(PAUSA_ENTRE_CONSULTAS)
-                        continue
-                    except (requests.RequestException, ValueError) as e:
-                        falhou = True
-                        print(f"[{agora}] {rotulo}: erro de rede/JSON: {e}")
-                        time.sleep(PAUSA_ENTRE_CONSULTAS)
-                        continue
- 
-                    if MODO_DIAGNOSTICO:
-                        print("\n=== RESPOSTA COMPLETA ===")
-                        print(json.dumps(dados, indent=2, ensure_ascii=False))
-                        print("=== FIM ===")
-                        print("Modo diagnostico: encerrando apos uma consulta.")
-                        return
- 
-                    tem_vaga, resumo = interpretar_resposta(dados, qtd, o, d, classe)
-                    if tem_vaga:
-                        anunciar_vaga(trecho, classe, qtd, resumo)
-                        achou = True
-                    else:
-                        print(f"[{agora}] #{tentativa} {rotulo}: {resumo}")
-                    time.sleep(PAUSA_ENTRE_CONSULTAS)
- 
-                if achou:
-                    pendentes.remove(trecho)
- 
-            if not pendentes:
-                break
- 
-            if falhou:
-                # servidor reclamando: espera cada vez mais (sem martelar o site)
-                espera = min(espera * 2, BACKOFF_MAXIMO)
-                print(f"Aguardando {espera}s antes de tentar de novo...")
+
+    while True:
+        tentativa += 1
+        falhou = False
+
+        for classe in classes:
+            agora = datetime.now().strftime("%H:%M:%S")
+            rotulo = (
+                f"{nome} {ESTACOES[o]} -> {ESTACOES[d]} "
+                f"{dt:%d/%m} [{CLASSES[classe]}]"
+            )
+
+            try:
+                dados = consultar(sessao, trecho, classe, qtd)
+
+            except requests.HTTPError as e:
+                falhou = True
+                with PRINT_LOCK:
+                    print(
+                        f"[{agora}] {rotulo}: "
+                        f"erro HTTP {e.response.status_code}"
+                    )
+                time.sleep(PAUSA_ENTRE_CONSULTAS)
+                continue
+
+            except (requests.RequestException, ValueError) as e:
+                falhou = True
+                with PRINT_LOCK:
+                    print(
+                        f"[{agora}] {rotulo}: "
+                        f"erro de rede/JSON: {e}"
+                    )
+                time.sleep(PAUSA_ENTRE_CONSULTAS)
+                continue
+
+            if MODO_DIAGNOSTICO:
+                with PRINT_LOCK:
+                    print("\n=== RESPOSTA COMPLETA ===")
+                    print(json.dumps(
+                        dados,
+                        indent=2,
+                        ensure_ascii=False
+                    ))
+                    print("=== FIM ===")
+                    print(
+                        "Modo diagnostico: encerrando apos uma consulta."
+                    )
+                return
+
+            tem_vaga, resumo = interpretar_resposta(
+                dados,
+                qtd,
+                o,
+                d,
+                classe
+            )
+
+            if tem_vaga:
+                # IMPORTANTE:
+                # nao damos break, nao encerramos a thread.
+                # O monitor continua procurando nas proximas consultas.
+                anunciar_vaga(
+                    trecho,
+                    classe,
+                    qtd,
+                    resumo
+                )
+
+                with PRINT_LOCK:
+                    print(
+                        f"[{datetime.now():%H:%M:%S}] "
+                        f"{rotulo}: vaga encontrada; "
+                        f"continuando monitoramento."
+                    )
+
             else:
-                espera = INTERVALO_SEGUNDOS
-            time.sleep(espera)
- 
-        print("\nTodos os trechos monitorados tiveram vaga. Encerrando.")
+                with PRINT_LOCK:
+                    print(
+                        f"[{agora}] #{tentativa} "
+                        f"{rotulo}: {resumo}"
+                    )
+
+            time.sleep(PAUSA_ENTRE_CONSULTAS)
+
+        if falhou:
+            # servidor reclamando: espera cada vez mais
+            espera = min(espera * 2, BACKOFF_MAXIMO)
+
+            with PRINT_LOCK:
+                print(
+                    f"[{nome}] Aguardando {espera}s "
+                    f"antes de tentar de novo..."
+                )
+        else:
+            espera = INTERVALO_SEGUNDOS
+
+        time.sleep(espera)
+
+
+# ----------------------------------------------------------------------
+# MONITORAMENTO
+# ----------------------------------------------------------------------
+def iniciar_monitoramento(trechos, classes, qtd, tipo):
+    """Inicia os monitores.
+
+    So ida:
+        uma thread para a ida.
+
+    Ida e volta:
+        uma thread para a ida e uma thread para a volta.
+
+    Cada thread continua rodando mesmo depois de encontrar uma passagem.
+    """
+
+    threads = []
+
+    if tipo == 1:
+        thread_ida = threading.Thread(
+            target=monitorar_trecho,
+            args=(trechos[0], classes, qtd),
+            name="Monitor-Ida",
+            daemon=True
+        )
+
+        threads.append(thread_ida)
+
+    else:
+        # --------------------------------------------------------------
+        # IDA
+        # --------------------------------------------------------------
+        thread_ida = threading.Thread(
+            target=monitorar_trecho,
+            args=(trechos[0], classes, qtd),
+            name="Monitor-Ida",
+            daemon=True
+        )
+
+        # --------------------------------------------------------------
+        # VOLTA
+        # --------------------------------------------------------------
+        thread_volta = threading.Thread(
+            target=monitorar_trecho,
+            args=(trechos[1], classes, qtd),
+            name="Monitor-Volta",
+            daemon=True
+        )
+
+        threads.append(thread_ida)
+        threads.append(thread_volta)
+
+    print("\nIniciando monitoramento paralelo...")
+    
+    for thread in threads:
+        thread.start()
+
+    try:
+        while True:
+            time.sleep(1)
+
     except KeyboardInterrupt:
         print("\nMonitoramento interrompido.")
- 
- 
+
+
+def main():
+    trechos, classes, qtd, tipo = montar_trechos()
+
+    try:
+        iniciar_monitoramento(
+            trechos,
+            classes,
+            qtd,
+            tipo
+        )
+
+    except KeyboardInterrupt:
+        print("\nMonitoramento interrompido.")
+
+
 if __name__ == "__main__":
     main()
- 
