@@ -1,332 +1,794 @@
 """
-Monitor de disponibilidade - Trem de Passageiros EFVM (Vale)
- 
+Monitor de disponibilidade - Trem de Passageiros EFVM (Vale) [Versão Aprimorada]
+
+Instalação (uma vez):
+    pip install playwright
+    (Se não tiver o Google Chrome instalado: playwright install chromium)
+
 Uso:
-    pip install requests
     python efvmTicketSearcher.py
- 
-Comportamento:
-  - SO IDA: ao encontrar passagem, avisa, PARA a busca e pergunta se o
-    usuario quer fazer uma nova busca ou encerrar o programa.
-  - IDA E VOLTA: monitora IDA e VOLTA em paralelo.
-      * Vaga individual (so ida ou so volta): avisa, mas continua buscando.
-      * Vaga nos dois trechos AO MESMO TEMPO (conjunto): avisa, PARA a busca
-        e pergunta se o usuario quer fazer uma nova busca ou encerrar.
 """
- 
+
+import base64
 import json
-import threading
+import os
+import re
+import shutil
+import subprocess
+import sys
 import time
-from datetime import date, datetime, timedelta, timezone
- 
-import requests
- 
+import unicodedata
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from urllib.parse import urlencode
+
+
+# ----------------------------------------------------------------------
+# AJUSTES DE CONSOLE NO WINDOWS (UTF-8, TÍTULO E QUICKEDIT)
+# ----------------------------------------------------------------------
+def desabilitar_quickedit():
+    """Desabilita o QuickEdit mode no Windows CMD para evitar que cliques pausem a execução."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        hStdin = kernel32.GetStdHandle(-10)  # STD_INPUT_HANDLE
+        mode = ctypes.c_ulong()
+        if kernel32.GetConsoleMode(hStdin, ctypes.byref(mode)):
+            ENABLE_QUICK_EDIT_MODE = 0x0040
+            ENABLE_EXTENDED_FLAGS = 0x0080
+            new_mode = (mode.value & ~ENABLE_QUICK_EDIT_MODE) | ENABLE_EXTENDED_FLAGS
+            kernel32.SetConsoleMode(hStdin, new_mode)
+        kernel32.SetConsoleTitleW("EFVM Ticket Monitor - Trem de Passageiros (Vale)")
+    except Exception:
+        pass
+
+
+try:
+    if sys.platform == "win32":
+        os.system("")
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 try:
     import winsound  # Windows
 except ImportError:
     winsound = None
- 
+
+try:
+    from playwright.sync_api import sync_playwright, Error as PlaywrightError
+except ImportError:
+    print("\n[!] Playwright não encontrado. Para instalar, execute:")
+    print("    pip install playwright")
+    print("    playwright install chromium\n")
+    sys.exit(1)
+
+
 # ----------------------------------------------------------------------
-# CONFIGURACOES GERAIS
+# ESTILOS E CORES ANSI
 # ----------------------------------------------------------------------
-BASE = "https://tremdepassageiros.vale.com/sgpweb/rest/externo"
-CODIGO_FERROVIA = "03"            # Estrada de Ferro Vitoria a Minas
-DIAS_LIBERACAO_VENDA = 45         # quantidadeDiasLiberacaoVenda
+class Cor:
+    RESET = "\033[0m"
+    NEGRITO = "\033[1m"
+    DIM = "\033[2m"
+    ITALICO = "\033[3m"
+    SUBLINHADO = "\033[4m"
+
+    VERDE = "\033[92m"
+    VERDE_ESCURO = "\033[32m"
+    AMARELO = "\033[93m"
+    AZUL = "\033[94m"
+    CIANO = "\033[96m"
+    VERMELHO = "\033[91m"
+    MAGENTA = "\033[95m"
+    BRANCO = "\033[97m"
+    CINZA = "\033[90m"
+
+
+def c_str(texto, *estilos):
+    """Aplica estilos ANSI se suportado."""
+    return f"{''.join(estilos)}{texto}{Cor.RESET}"
+
+
+# ----------------------------------------------------------------------
+# CONFIGURAÇÕES GERAIS
+# ----------------------------------------------------------------------
+SITE = "https://tremdepassageiros.vale.com/"
+API = "https://tremdepassageiros.vale.com/api/pv"
+SIGLA_NORMATIVA = "EFVM"
+ESTRADA_FERRO_ID = 2              # EFVM
+
+DIAS_LIBERACAO_VENDA = 45         # usado só se a lista de datas do site falhar
+MAX_PASSAGEIROS = 15              # quantidade máxima de passagens por CPF
 INTERVALO_SEGUNDOS = 30           # intervalo entre ciclos de consulta
 PAUSA_ENTRE_CONSULTAS = 2         # segundos entre consultas dentro do mesmo ciclo
-BACKOFF_MAXIMO = 600              # em erro, espera ate 10 min entre tentativas
- 
-HEADERS = {
-    "Content-Type": "application/json",
-    "Accept": "application/json, text/plain, */*",
-    "Origin": "https://tremdepassageiros.vale.com",
-    "Referer": "https://tremdepassageiros.vale.com/sgpweb/portal/index.html",
-    "User-Agent": "Mozilla/5.0 (monitor pessoal de disponibilidade)",
-}
- 
-URL_COMPRA = "https://tremdepassageiros.vale.com/sgpweb/portal/index.html#/home"
- 
-# Tecla usada para voltar durante o preenchimento dos dados.
-TECLA_VOLTAR = "V"
- 
-# Visual do terminal
-LARGURA = 70
-LINHA_DUPLA = "=" * LARGURA
-LINHA_SIMPLES = "-" * LARGURA
- 
-# Lock para impedir que duas threads escrevam no terminal ao mesmo tempo.
-PRINT_LOCK = threading.Lock()
- 
-# ----------------------------------------------------------------------
-# DADOS JA CONHECIDOS
-# ----------------------------------------------------------------------
-ESTACOES = {
-    7166: "Aimores",
-    7180: "Antonio Dias",
-    7160: "Aricanga (Ibiracu / Aracruz)",
-    7165: "Baixo Guandu",
-    7170: "Barra do Cuiete (Conselheiro Pena)",
-    7185: "Belo Horizonte",
-    7162: "Colatina",
-    7169: "Conselheiro Pena",
-    7168: "Crenaque (Resplendor)",
-    7181: "Desembargador Drumond (Nova Era)",
-    7184: "Dois Irmaos (Barao de Cocais / Sta. Barbara)",
-    7158: "Flexal",
-    7176: "Frederico Sellow (Cachoeira Escura / Belo Oriente)",
-    7159: "Fundao",
-    7173: "Governador Valadares",
-    7178: "Intendente Camara (Ipatinga)",
-    7177: "Ipaba",
-    7183: "Itabira",
-    7163: "Itapina (Colatina)",
-    7182: "Joao Monlevade",
-    7164: "Mascarenhas (Baixo Guandu)",
-    7179: "Mario Carvalho (Timoteo)",
-    7174: "Pedra Corrida (Periquito)",
-    7157: "Pedro Nolasco (Cariacica / Vitoria)",
-    7175: "Periquito",
-    7161: "Piraqueacu (J. Neiva / Linhares / S. Mateus)",
-    7167: "Resplendor",
-    7186: "Rio Piracicaba",
-    7171: "Sao Tome do Rio Doce (Tumiritinga)",
-    7172: "Tumiritinga",
-}
- 
-CLASSES = {
-    43: "Economica",
-    44: "Executiva",
-    45: "Cadeirante",
-}
- 
-# Tipos de passagem (o app usa Tarifa Normal; os outros estao aqui se precisar)
-TIPO_TARIFA_NORMAL = 33
-TIPOS_PASSAGEM = {
-    33: "Tarifa Normal (INT)",
-    37: "Beneficio Idoso (IDO)",
-    38: "PCD (PLD)",
-    113: "Acompanhante de PCD (ACOMPCD)",
-    39: "Crianca ate 5 anos no colo (COL)",
-    116: "Jovem Baixa Renda (JBR)",
-    195: "Acompanhante Cadeirante - Tarifa Normal (ACOMTN)",
-}
- 
-# ======================================================================
-# ENDPOINT DE DISPONIBILIDADE (copiado do site: pesquisaPassagem)
-# ======================================================================
-URL_DISPONIBILIDADE = BASE + "/VendaInternet/publico/pesquisaPassagem"
- 
-# No site, o campo "tremFerias" vem false com Embarque = Dia.
-# Para monitorar o trem da noite (alta temporada), mude para True
-# (suposicao: nao confirmei que Noite = true).
-TREM_FERIAS = False
- 
-# Se True: faz UMA consulta, imprime a resposta completa e encerra a busca.
+PAUSA_ENTRE_VIAGENS = 0.5         # segundos entre chamadas de assentos
+BACKOFF_MAXIMO = 600              # em erro de conexão, aguarda até 10 min
+TIPO_PASSAGEM_NORMAL = 101        # Tarifa Normal
+MARGEM_RENOVAR = 180              # renova o token quando faltar menos que 3 min
+
+PERFIL_ANTIGO = Path(__file__).resolve().parent / "perfil_vale"
+
 MODO_DIAGNOSTICO = False
- 
-# O site manda a data como meia-noite de Brasilia em milissegundos.
-BRT = timezone(timedelta(hours=-3))
- 
- 
-def data_para_ms(d):
-    return int(datetime(d.year, d.month, d.day, tzinfo=BRT).timestamp() * 1000)
- 
- 
-def montar_payload(origem_id, destino_id, data_viagem, classe_id, qtd):
-    """Mesmo formato que o site envia (so ida; a volta e consultada como
-    uma viagem de ida no sentido inverso)."""
-    return {
-        "codigoFerrovia": CODIGO_FERROVIA,
-        "codigoLocalOrigem": origem_id,
-        "codigoLocalDestino": destino_id,
-        "dataIda": data_para_ms(data_viagem),
-        "codigoClasse": classe_id,
-        "detalheVenda": [
-            {"detalhe": TIPO_TARIFA_NORMAL, "qtd": qtd, "funcionario": False}
-        ],
-        "tremFerias": TREM_FERIAS,
-    }
- 
- 
-def interpretar_resposta(dados, qtd, origem, destino, classe):
-    """Devolve (tem_vaga, resumo).
- 
-    - Resposta sem passagens: "excessao" preenchido e "passagensIda" nulo.
-    - Resposta com passagens: lista em "passagensIda". Como o site tem
-      "buscarPorSubTrecho", o servidor pode devolver um trecho diferente
-      do pedido; so conto como vaga se origem, destino e classe baterem.
-    """
-    exc = dados.get("excessao")
-    if exc:
-        if exc.get("tipo") == "N":
-            return False, "sem passagens"
-        desc = (exc.get("descricao") or "").strip().replace("\n", " ")
-        return False, f"aviso do servidor (tipo {exc.get('tipo')}): {desc[:120]}"
- 
-    passagens = dados.get("passagensIda") or []
-    corretas, outros = [], set()
-    for p in passagens:
-        if (p.get("idOrigem") == origem and p.get("idDestino") == destino
-                and p.get("idClasse", classe) == classe):
-            corretas.append(p)
-        else:
-            outros.add(f"{p.get('descricaoOrigem')} -> {p.get('descricaoDestino')}")
- 
-    if corretas:
-        linhas = []
-        for p in corretas:
-            ms = p.get("partidaPrevista")
-            dia = datetime.fromtimestamp(ms / 1000, BRT).strftime("%d/%m") if ms else "--/--"
-            valor = f"R$ {p.get('valorTotal', 0):.2f}".replace(".", ",")
-            linhas.append(
-                f"    Trem {p.get('descricaoTrem')}  {dia}  "
-                f"saida {p.get('horaPartidaPrevista')} -> chegada {p.get('horaChegadaPrevista')}  "
-                f"{p.get('descricaoClasse')}  {valor}"
-            )
-        return True, "\n".join(linhas)
-    if passagens:
-        return False, "servidor devolveu so outro trecho (" + ", ".join(sorted(outros)) + "), ignorado"
-    return False, "resposta sem passagens"
- 
- 
+TECLA_VOLTAR = "V"
+
+LARGURA = 76
+LINHA_TRILHO = "═" * LARGURA
+LINHA_SIMPLES = "─" * LARGURA
+
+
 # ----------------------------------------------------------------------
-# UTILITARIOS DE TELA
+# ARTES ASCII & BANNERS VISUAIS
 # ----------------------------------------------------------------------
-def log(msg):
-    with PRINT_LOCK:
-        print(msg)
- 
- 
-def titulo_secao(texto):
+BANNER_TREM = r"""
+  ╔══════════════════════════════════════════════════════════════════════════════╗
+  ║                                                                              ║
+  ║        o O O                                                                 ║
+  ║       o              ___________   ___________   ___________                 ║
+  ║      o    _||_      |  EFVM 🚂  | | Passageiros| |  VALE 🎫  |               ║
+  ║     [__||_||_||__]  |___________| |___________| |___________|                ║
+  ║    ={____|  |____}  (o)(o) (o)(o) (o)(o) (o)(o) (o)(o) (o)(o)                ║
+  ║  ══════════════════════════════════════════════════════════════════════════  ║
+  ║      🚂 ESTRADA DE FERRO VITÓRIA A MINAS (EFVM) - MONITOR DE PASSAGENS       ║
+  ║             Belo Horizonte ⇄ Vitória (Pedro Nolasco) | Linha Vale            ║
+  ╚══════════════════════════════════════════════════════════════════════════════╝
+"""
+
+
+def banner_principal():
+    print(c_str(BANNER_TREM, Cor.CIANO, Cor.NEGRITO))
+
+
+def titulo_etapa(numero, total, titulo):
     print()
-    print(LINHA_SIMPLES)
-    print(f" {texto}")
-    print(LINHA_SIMPLES)
- 
- 
+    barra = f"═[ 🚂 ETAPA {numero}/{total}: {titulo.upper()} ]"
+    resto = LARGURA - len(barra)
+    if resto > 0:
+        barra += "═" * resto
+    print(c_str(barra, Cor.CIANO, Cor.NEGRITO))
+
+
+def subtitulo(texto):
+    print(c_str(f"\n─── {texto} " + "─" * max(2, LARGURA - len(texto) - 6), Cor.CINZA))
+
+
+# ----------------------------------------------------------------------
+# DADOS DE ESTAÇÕES E CLASSES
+# ----------------------------------------------------------------------
+ESTACOES_PADRAO = {
+    16: "Pedro Nolasco",
+    17: "Flexal",
+    18: "Fundao",
+    19: "Aricanga",
+    20: "Piraqueacu",
+    21: "Colatina",
+    22: "Itapina",
+    23: "Mascarenhas",
+    24: "Baixo Guandu",
+    25: "Aimores",
+    26: "Resplendor",
+    27: "Krenak",
+    28: "Conselheiro Pena",
+    29: "Barra do Cuiete",
+    30: "Sao Tome do Rio Doce",
+    31: "Tumiritinga",
+    32: "Governador Valadares",
+    33: "Pedra Corrida",
+    34: "Periquito",
+    35: "Frederico Sellow",
+    36: "Ipaba",
+    37: "Intendente Camara",
+    38: "Mario Carvalho",
+    39: "Antonio Dias",
+    40: "Desembargador Drumond",
+    41: "Joao Monlevade",
+    42: "Rio Piracicaba",
+    43: "Dois Irmaos",
+    44: "Belo Horizonte",
+    45: "Itabira",
+}
+
+CLASSES = {
+    1: "Executivo",
+    2: "Economico",
+    3: "Cadeirante",
+}
+
+ESTACOES = dict(ESTACOES_PADRAO)
+
+
+# ----------------------------------------------------------------------
+# UTILITÁRIOS GERAIS
+# ----------------------------------------------------------------------
+def sem_acentos(txt):
+    return "".join(
+        c for c in unicodedata.normalize("NFKD", str(txt)) if not unicodedata.combining(c)
+    )
+
+
+def log(msg=""):
+    print(msg, flush=True)
+
+
+def hora():
+    return datetime.now().strftime("%H:%M:%S")
+
+
+def apito_de_trem(repeticoes=3):
+    """Alerta sonoro com ritmo que simula o apito de uma locomotiva."""
+    for _ in range(repeticoes):
+        if winsound:
+            try:
+                winsound.Beep(587, 350)  # D5
+                time.sleep(0.08)
+                winsound.Beep(587, 500)  # D5
+                time.sleep(0.2)
+                winsound.Beep(440, 600)  # A4
+            except Exception:
+                try:
+                    winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+                except Exception:
+                    pass
+        else:
+            print("\a", end="", flush=True)
+        time.sleep(1.2)
+
+
+def jwt_exp(token):
+    """Lê o timestamp 'exp' do payload JWT sem checar assinatura."""
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        dados = json.loads(base64.urlsafe_b64decode(payload))
+        return float(dados.get("exp", time.time() + 3600))
+    except Exception:
+        return time.time() + 3600
+
+
+class ErroApi(Exception):
+    pass
+
+
+JS_FETCH = """async ([metodo, url, corpo, cab]) => {
+    const h = {
+        "authorization": cab["authorization"],
+        "x-sigla-normativa": cab["x-sigla-normativa"],
+        "x-origem-requisicao": cab["x-origem-requisicao"],
+        "accept": cab["accept"],
+    };
+    const opts = {method: metodo, headers: h, credentials: "include"};
+    if (corpo !== null && corpo !== undefined) {
+        h["content-type"] = "application/json";
+        opts.body = JSON.stringify(corpo);
+    }
+    const r = await fetch(url, opts);
+    return {status: r.status, texto: await r.text()};
+}"""
+
+
+# ----------------------------------------------------------------------
+# GERENCIAMENTO DE SESSÃO & NAVEGADOR
+# ----------------------------------------------------------------------
+class Sessao:
+    """
+    Gerencia a autenticação visual automática e a execução das buscas em segundo plano.
+    O login abre a janela visível; após o usuário logar, a janela fecha sozinha.
+    Todas as buscas seguintes rodam em modo headless invisível, protegidas contra 403.
+    """
+
+    def __init__(self, pw):
+        self.pw = pw
+        self.token = None
+        self.token_exp = 0.0
+        self.captura_ts = 0.0
+        self.datas = None
+        self.browser = None
+        self.ctx = None
+        self.page = None
+
+    def _abrir_navegador(self, headless=True, storage_state=None):
+        """Abre uma instância do Chromium (visível ou invisível)."""
+        launch_args = [
+            "--disable-blink-features=AutomationControlled",
+            "--no-default-browser-check",
+            "--disable-infobars",
+        ]
+        ultimo_erro = None
+        for canal in ("chrome", None):
+            try:
+                kw = dict(headless=headless, args=launch_args)
+                if canal:
+                    kw["channel"] = canal
+                self.browser = self.pw.chromium.launch(**kw)
+                break
+            except PlaywrightError as e:
+                ultimo_erro = e
+        else:
+            log(c_str("\n[!] Não foi possível abrir o Chromium.", Cor.VERMELHO, Cor.NEGRITO))
+            log("    Instale o Google Chrome ou execute: playwright install chromium")
+            if ultimo_erro:
+                log(f"    Detalhes: {str(ultimo_erro).splitlines()[0]}")
+            sys.exit(1)
+
+        ctx_kwargs = dict(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+            ),
+            locale="pt-BR",
+            viewport={"width": 1280, "height": 720},
+        )
+        if storage_state:
+            ctx_kwargs["storage_state"] = storage_state
+
+        self.ctx = self.browser.new_context(**ctx_kwargs)
+        self.ctx.on("request", self._on_request)
+
+        self.page = self.ctx.new_page()
+        try:
+            self.page.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+            )
+        except Exception:
+            pass
+
+    def _fechar_navegador(self):
+        """Fecha navegador e contexto em execução."""
+        for obj in (self.ctx, self.browser):
+            try:
+                if obj:
+                    obj.close()
+            except Exception:
+                pass
+        self.ctx = self.browser = self.page = None
+
+    def fechar(self):
+        self._fechar_navegador()
+        self.token = None
+        self.token_exp = 0.0
+
+    # -- Captura de token de autorização -------------------------------
+    def _on_request(self, req):
+        try:
+            if "/api/pv/" not in req.url:
+                return
+            auth = req.headers.get("authorization", "")
+            if not auth.lower().startswith("bearer "):
+                return
+            tok = auth[7:].strip()
+            exp = jwt_exp(tok)
+            # Prioriza tokens com maior validade e obtidos diretamente do cabeçalho
+            if exp >= self.token_exp or (self.token_exp - time.time() < 60):
+                self.token = tok
+                self.token_exp = exp
+                self.captura_ts = time.time()
+        except Exception:
+            pass
+
+    def _capturar_token_storage(self):
+        """
+        Extrai especificamente o AccessToken do MSAL (Azure B2C).
+        Evita pegar o IdToken por engano, prevenindo o erro HTTP 403.
+        """
+        if not self.page:
+            return False
+        try:
+            tok = self.page.evaluate("""() => {
+                try {
+                    // 1. Procura estritamente por AccessToken no localStorage do MSAL
+                    for (let i = 0; i < localStorage.length; i++) {
+                        const k = (localStorage.key(i) || "").toLowerCase();
+                        const v = localStorage.getItem(localStorage.key(i)) || "";
+                        if (k.includes("accesstoken") || v.includes("AccessToken")) {
+                            try {
+                                const parsed = JSON.parse(v);
+                                if (parsed.credentialType === "AccessToken" && parsed.secret) {
+                                    return parsed.secret;
+                                }
+                                if (parsed.secret && k.includes("accesstoken")) {
+                                    return parsed.secret;
+                                }
+                            } catch(e) {}
+                        }
+                    }
+                    // 2. Procura em sessionStorage
+                    for (let i = 0; i < sessionStorage.length; i++) {
+                        const k = (sessionStorage.key(i) || "").toLowerCase();
+                        const v = sessionStorage.getItem(sessionStorage.key(i)) || "";
+                        if (k.includes("accesstoken")) {
+                            try {
+                                const parsed = JSON.parse(v);
+                                if (parsed.secret) return parsed.secret;
+                            } catch(e) {}
+                        }
+                    }
+                } catch(e) {}
+                return null;
+            }""")
+            if tok and isinstance(tok, str) and tok.startswith("eyJ"):
+                exp = jwt_exp(tok)
+                if exp > time.time() and exp >= self.token_exp:
+                    self.token = tok
+                    self.token_exp = exp
+                    self.captura_ts = time.time()
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def token_valido(self, margem=MARGEM_RENOVAR):
+        if not self.token:
+            self._capturar_token_storage()
+        return bool(self.token) and (self.token_exp - time.time()) > margem
+
+    def bombear(self, segundos):
+        fim = time.time() + segundos
+        while True:
+            restante = fim - time.time()
+            if restante <= 0:
+                return
+            try:
+                self.page.wait_for_timeout(int(min(1.0, restante) * 1000))
+            except Exception:
+                time.sleep(min(1.0, restante))
+
+    # -- Fluxo de Login Visual com Fechamento Automático ---------------
+    def login_visual_automatico(self):
+        """
+        Abre a página da Vale em janela visível para o usuário fazer o login.
+        Assim que o login é concluído, fecha a janela automaticamente
+        e migra a sessão autenticada para o modo headless invisível.
+        """
+        print()
+        print(c_str("═" * LARGURA, Cor.CIANO))
+        print(c_str("  🔒 LOGIN NO SISTEMA DE VENDAS DA VALE", Cor.BRANCO, Cor.NEGRITO))
+        print(c_str("═" * LARGURA, Cor.CIANO))
+        print(c_str("  [+] Abrindo a janela do navegador...", Cor.AMARELO, Cor.NEGRITO))
+        print(c_str("  [+] Faça seu login normalmente na janela que abriu.", Cor.BRANCO))
+        print(c_str("  [+] Assim que você entrar, a janela fechará AUTOMATICAMENTE!", Cor.VERDE, Cor.NEGRITO))
+        print(c_str("═" * LARGURA, Cor.CIANO))
+
+        self._fechar_navegador()
+        self._abrir_navegador(headless=False)
+
+        try:
+            self.page.goto(SITE, wait_until="domcontentloaded", timeout=60000)
+            self.page.wait_for_timeout(2000)
+
+            # Clica no botão 'Entrar' automaticamente para já exibir os campos de login
+            try:
+                for seletor in [
+                    'text=/^\\s*(entrar|login|acessar)\\s*$/i',
+                    'a:has-text("Entrar")',
+                    'button:has-text("Entrar")',
+                    '[aria-label*="Entrar" i]',
+                ]:
+                    el = self.page.locator(seletor).first
+                    if el.is_visible():
+                        el.click(timeout=3000)
+                        break
+            except Exception:
+                pass
+        except PlaywrightError as e:
+            log(c_str(f"  [!] Aviso na navegação inicial: {str(e).splitlines()[0]}", Cor.CINZA))
+
+        print(c_str("\n  ⏳ Aguardando você concluir o login no navegador...", Cor.CIANO))
+
+        # Monitora ativamente o momento em que o login é efetuado
+        t0 = time.time()
+        timeout_max = 300  # até 5 minutos para o usuário logar
+        login_concluido = False
+
+        while time.time() - t0 < timeout_max:
+            # 1. Verifica se capturou access token do storage ou de requisições de API
+            if self._capturar_token_storage() or (self.token and self.token_valido(30)):
+                login_concluido = True
+                break
+
+            # 2. Se a URL voltou para o site oficial (fora do b2clogin)
+            try:
+                url_atual = self.page.url.lower()
+                if "tremdepassageiros.vale.com" in url_atual and "b2clogin" not in url_atual:
+                    # Dispara uma chamada leve interna para forçar o aplicativo a anexar o token
+                    self.page.evaluate("() => fetch('/api/pv/viagens/datas', {credentials: 'include'}).catch(() => {})")
+                    self.bombear(1.0)
+                    if self._capturar_token_storage() or (self.token and self.token_valido(30)):
+                        login_concluido = True
+                        break
+            except Exception:
+                pass
+
+            self.bombear(1.0)
+
+        if not login_concluido or not self.token:
+            log(c_str("\n  [!] Tempo esgotado ou login não concluído. Encerrando.", Cor.VERMELHO))
+            self.fechar()
+            sys.exit(1)
+
+        # Salva o estado dos cookies e tokens autenticados
+        estado_sessao = self.ctx.storage_state()
+
+        # Fecha a janela visível AUTOMATICAMENTE
+        self._fechar_navegador()
+
+        print(c_str("\n  ✅ Login concluído com sucesso!", Cor.VERDE, Cor.NEGRITO))
+        print(c_str("  🚪 Janela do navegador fechada automaticamente.", Cor.CIANO))
+        print(c_str("  🕶️  Iniciando buscas em segundo plano (modo silencioso)...\n", Cor.CINZA))
+
+        # Abre o navegador headless em segundo plano com a mesma sessão autenticada
+        self._abrir_navegador(headless=True, storage_state=estado_sessao)
+
+        # Valida o token com uma consulta de teste
+        try:
+            self.page.goto(SITE, wait_until="domcontentloaded", timeout=45000)
+            self._garantir_token_valido()
+        except Exception:
+            pass
+
+    def _garantir_token_valido(self):
+        """Garante que temos o token Bearer válido fazendo chamada direta no contexto da página."""
+        if self.token and self.token_valido(60):
+            return True
+        try:
+            self._capturar_token_storage()
+            if not self.token or not self.token_valido(60):
+                self.page.evaluate("() => fetch('/api/pv/viagens/datas', {credentials: 'include'}).catch(() => {})")
+                self.bombear(1.5)
+                self._capturar_token_storage()
+        except Exception:
+            pass
+        return bool(self.token)
+
+    # -- Chamadas HTTP à API Oficial -----------------------------------
+    def _cabecalhos(self):
+        return {
+            "authorization": "Bearer " + (self.token or ""),
+            "x-sigla-normativa": SIGLA_NORMATIVA,
+            "x-origem-requisicao": "vendas",
+            "origin": SITE.rstrip("/"),
+            "referer": SITE,
+            "accept": "application/json, text/plain, */*",
+        }
+
+    def chamar(self, metodo, caminho, corpo=None, params=None):
+        """
+        Executa chamadas HTTP seguras dentro do contexto da página.
+        Se ocorrer 401/403, renova a sessão automaticamente.
+        """
+        for tentativa in (1, 2):
+            self._garantir_token_valido()
+
+            url = API + caminho
+            if params:
+                url += "?" + urlencode(params)
+
+            try:
+                if not self.page or self.page.is_closed():
+                    self._abrir_navegador(headless=True)
+                    self.page.goto(SITE, wait_until="domcontentloaded", timeout=45000)
+
+                res = self.page.evaluate(JS_FETCH, [metodo, url, corpo, self._cabecalhos()])
+            except PlaywrightError as e:
+                msg = str(e).splitlines()[0] if str(e) else "erro"
+                raise ErroApi(f"Falha de comunicação: {msg}")
+
+            status = res.get("status")
+            texto = res.get("texto") or ""
+
+            # Se der 401 ou 403 na primeira tentativa, tenta revalidar o token e tentar de novo
+            if status in (401, 403) and tentativa == 1:
+                self.token_exp = 0.0
+                try:
+                    self.page.evaluate("() => fetch('/api/pv/viagens/datas', {credentials: 'include'}).catch(() => {})")
+                    self.bombear(2.0)
+                    self._capturar_token_storage()
+                except Exception:
+                    pass
+                continue
+
+            if status != 200:
+                trecho = " ".join(texto.split())[:150]
+                raise ErroApi(f"HTTP {status} {trecho}")
+
+            try:
+                return json.loads(texto)
+            except Exception:
+                raise ErroApi("Resposta da Vale não está em formato JSON válido")
+
+        raise ErroApi("Acesso não autorizado após renovação")
+
+    def carregar_dados_site(self):
+        """Atualiza catálogo de estações e datas liberadas pelo site."""
+        global ESTACOES
+        try:
+            dados = self.chamar("GET", f"/estacao/estrada-ferro/{ESTRADA_FERRO_ID}")
+            lista = dados.get("content") if isinstance(dados, dict) else dados
+            novas = {
+                int(e["id"]): sem_acentos(e["nome"])
+                for e in (lista or [])
+                if e.get("id") is not None and e.get("nome")
+            }
+            if len(novas) >= 5:
+                ESTACOES = novas
+        except Exception:
+            pass
+
+        try:
+            dados = self.chamar("GET", "/viagens/datas")
+            lista = dados.get("content") if isinstance(dados, dict) else dados
+            datas = {date(int(x["ano"]), int(x["mes"]), int(x["dia"])) for x in (lista or [])}
+            self.datas = datas or None
+        except Exception:
+            self.datas = None
+
+
+# ----------------------------------------------------------------------
+# INTERFACE INTERATIVA COM O USUÁRIO
+# ----------------------------------------------------------------------
 def mostrar_selecao(dados):
-    """Mostra o que ja foi escolhido, para o usuario nao se perder ao voltar."""
     partes = []
     if dados.get("tipo"):
-        partes.append("Viagem: " + ("so ida" if dados["tipo"] == 1 else "ida e volta"))
+        tipo_str = "Somente Ida" if dados["tipo"] == 1 else "Ida e Volta"
+        partes.append(f"Modalidade : {c_str(tipo_str, Cor.BRANCO, Cor.NEGRITO)}")
     if dados.get("origem"):
-        partes.append(f"De: {ESTACOES[dados['origem']]}")
+        partes.append(f"Origem     : {c_str(ESTACOES[dados['origem']], Cor.VERDE, Cor.NEGRITO)}")
     if dados.get("destino"):
-        partes.append(f"Para: {ESTACOES[dados['destino']]}")
+        partes.append(f"Destino    : {c_str(ESTACOES[dados['destino']], Cor.VERDE, Cor.NEGRITO)}")
     if dados.get("classes"):
-        partes.append("Classe: " + " + ".join(CLASSES[c] for c in dados["classes"]))
+        desc = " + ".join(CLASSES[c] for c in dados["classes"])
+        partes.append(f"Classe(s)  : {c_str(desc, Cor.AMARELO, Cor.NEGRITO)}")
     if dados.get("qtd"):
-        partes.append(f"Passageiros: {dados['qtd']}")
+        partes.append(f"Passageiros: {c_str(str(dados['qtd']), Cor.BRANCO, Cor.NEGRITO)}")
     if dados.get("d1"):
-        partes.append(f"Ida: {dados['d1']:%d/%m/%Y}")
+        d1_fmt = dados["d1"].strftime("%d/%m/%Y")
+        partes.append(f"Data Ida   : {c_str(d1_fmt, Cor.CIANO, Cor.NEGRITO)}")
     if dados.get("d2"):
-        partes.append(f"Volta: {dados['d2']:%d/%m/%Y}")
+        d2_fmt = dados["d2"].strftime("%d/%m/%Y")
+        partes.append(f"Data Volta : {c_str(d2_fmt, Cor.CIANO, Cor.NEGRITO)}")
+
     if partes:
-        print("\n  Escolhido ate agora:")
+        print(c_str("\n  ┌─ Dados selecionados até agora ─────────────────────────────", Cor.CINZA))
         for p in partes:
-            print(f"    - {p}")
- 
- 
-# ----------------------------------------------------------------------
-# INTERFACE (menus)
-# ----------------------------------------------------------------------
-def escolher_de_lista(titulo, opcoes):
-    """opcoes: dict id -> nome. Retorna o id escolhido ou None (voltar)."""
-    itens = sorted(opcoes.items(), key=lambda kv: kv[1])
-    titulo_secao(titulo)
-    for i, (_, nome) in enumerate(itens, 1):
-        print(f"  {i:2d}) {nome}")
-    print(f"  {TECLA_VOLTAR}) Voltar")
+            print(f"  │  {p}")
+        print(c_str("  └────────────────────────────────────────────────────────────", Cor.CINZA))
+
+
+def escolher_estacao(titulo, opcoes):
+    itens = sorted(opcoes.items(), key=lambda kv: sem_acentos(kv[1]).lower())
+    subtitulo(titulo)
+
+    metade = (len(itens) + 1) // 2
+    for i in range(metade):
+        col1 = f"  [{i+1:2d}] {itens[i][1]:<24}"
+        col2 = ""
+        if i + metade < len(itens):
+            col2 = f" [{i+metade+1:2d}] {itens[i+metade][1]}"
+        print(c_str(col1, Cor.BRANCO) + c_str(col2, Cor.BRANCO))
+
+    print(c_str(f"\n  [{TECLA_VOLTAR}] ↩️  Voltar à etapa anterior", Cor.AMARELO, Cor.NEGRITO))
+
     while True:
-        txt = input("Digite o numero: ").strip()
+        txt = input(c_str("\n  Digite o número da estação: ", Cor.CIANO, Cor.NEGRITO)).strip()
         if txt.upper() == TECLA_VOLTAR:
             return None
         if txt.isdigit() and 1 <= int(txt) <= len(itens):
             return itens[int(txt) - 1][0]
-        print("Opcao invalida.")
- 
- 
-def pedir_data(rotulo, minimo=None):
+        print(c_str("  [!] Opção inválida. Digite o número correspondente à estação.", Cor.VERMELHO))
+
+
+def pedir_data(rotulo, datas, minimo=None):
     hoje = date.today()
-    primeiro = max(hoje + timedelta(days=1), minimo or hoje)
-    ultimo = hoje + timedelta(days=DIAS_LIBERACAO_VENDA)
-    titulo_secao(rotulo.upper())
-    print(f"  Periodo aceito: {primeiro:%d/%m/%Y} a {ultimo:%d/%m/%Y}")
-    print("  (nao ha venda para o mesmo dia da viagem)")
-    print(f"  {TECLA_VOLTAR} = voltar")
+    base = max(hoje, minimo or hoje)
+    if datas:
+        validas = sorted(d for d in datas if d >= base)
+        if not validas:
+            print(c_str(f"  [!] Não há datas liberadas a partir de {base:%d/%m/%Y}.", Cor.VERMELHO))
+            return None
+        primeiro, ultimo = validas[0], validas[-1]
+    else:
+        primeiro, ultimo = base, hoje + timedelta(days=DIAS_LIBERACAO_VENDA)
+
+    subtitulo(rotulo.upper())
+    print(c_str(f"  • Intervalo aceito : {primeiro:%d/%m/%Y} até {ultimo:%d/%m/%Y}", Cor.CINZA))
+    print(c_str(f"  • Pressione [{TECLA_VOLTAR}] para voltar", Cor.CINZA))
+
     while True:
-        txt = input("Data (DD/MM/AAAA): ").strip()
+        txt = input(c_str(f"  📅 Data da {rotulo} (DD/MM/AAAA): ", Cor.CIANO, Cor.NEGRITO)).strip()
         if txt.upper() == TECLA_VOLTAR:
             return None
         try:
             d = datetime.strptime(txt, "%d/%m/%Y").date()
         except ValueError:
-            print("  Formato invalido. Use DD/MM/AAAA.")
+            print(c_str("  [!] Formato inválido. Digite no formato DD/MM/AAAA (ex: 25/12/2026).", Cor.VERMELHO))
             continue
         if d < primeiro:
-            print(f"  A data deve ser a partir de {primeiro:%d/%m/%Y}.")
+            print(c_str(f"  [!] A data deve ser a partir de {primeiro:%d/%m/%Y}.", Cor.VERMELHO))
         elif d > ultimo:
-            print(f"  A venda so abre ate {ultimo:%d/%m/%Y}.")
+            print(c_str(f"  [!] A venda no site só está aberta até {ultimo:%d/%m/%Y}.", Cor.VERMELHO))
+        elif datas and d not in datas:
+            print(c_str("  [!] Essa data específica não consta como liberada no calendário do site.", Cor.VERMELHO))
         else:
             return d
- 
- 
+
+
 def pedir_inteiro(rotulo, minimo, maximo, permitir_voltar=True):
-    sufixo = f", {TECLA_VOLTAR}=voltar" if permitir_voltar else ""
+    sufixo = f", ou [{TECLA_VOLTAR}] para voltar" if permitir_voltar else ""
     while True:
-        txt = input(f"{rotulo} ({minimo}-{maximo}{sufixo}): ").strip()
+        txt = input(c_str(f"  {rotulo} ({minimo}-{maximo}{sufixo}): ", Cor.CIANO, Cor.NEGRITO)).strip()
         if permitir_voltar and txt.upper() == TECLA_VOLTAR:
             return None
         if txt.isdigit() and minimo <= int(txt) <= maximo:
             return int(txt)
-        print("Valor invalido.")
- 
- 
+        print(c_str(f"  [!] Valor inválido. Digite um número entre {minimo} e {maximo}.", Cor.VERMELHO))
+
+
 def escolher_classes():
-    """Devolve a lista de ids de classe a monitorar (ou None para voltar)."""
-    titulo_secao("CLASSE")
-    print("  1) Economica")
-    print("  2) Executiva")
-    print("  3) Ambas (Economica + Executiva)")
-    print("  4) Cadeirante")
-    print(f"  {TECLA_VOLTAR}) Voltar")
+    subtitulo("SELEÇÃO DE CLASSE")
+    print(c_str("  [1] 💺 Econômico", Cor.BRANCO))
+    print(c_str("  [2] 🛋️  Executivo", Cor.BRANCO))
+    print(c_str("  [3] ✨ Ambas (Econômico ou Executivo)", Cor.BRANCO))
+    print(c_str("  [4] ♿ Cadeirante", Cor.BRANCO))
+    print(c_str(f"  [{TECLA_VOLTAR}] ↩️  Voltar", Cor.AMARELO, Cor.NEGRITO))
+
     while True:
-        txt = input("Escolha: ").strip()
+        txt = input(c_str("\n  Escolha a classe desejada: ", Cor.CIANO, Cor.NEGRITO)).strip()
         if txt.upper() == TECLA_VOLTAR:
             return None
         if txt.isdigit() and 1 <= int(txt) <= 4:
-            return {1: [43], 2: [44], 3: [43, 44], 4: [45]}[int(txt)]
-        print("Opcao invalida.")
- 
- 
-def montar_trechos():
-    """Pergunta tudo ao usuario e devolve (trechos, classes, qtd, tipo)."""
+            return {1: [2], 2: [1], 3: [2, 1], 4: [3]}[int(txt)]
+        print(c_str("  [!] Opção inválida. Escolha de 1 a 4.", Cor.VERMELHO))
+
+
+def exibir_cartao_resumo(trechos, classes, qtd, tipo):
     print()
-    print(LINHA_DUPLA)
-    print(" MONITOR DE PASSAGENS - TREM DE PASSAGEIROS EFVM (VALE)")
-    print(LINHA_DUPLA)
- 
+    print(c_str("  ╔══════════════════════════════════════════════════════════════════════╗", Cor.VERDE, Cor.NEGRITO))
+    print(c_str("  ║ 🎫 BILHETE DE MONITORAMENTO - ESTRADA DE FERRO VITÓRIA A MINAS       ║", Cor.VERDE, Cor.NEGRITO))
+    print(c_str("  ╠══════════════════════════════════════════════════════════════════════╣", Cor.VERDE))
+    for nome, org, dst, dt in trechos:
+        icone = "🚂 IDA  " if nome == "IDA" else "🔄 VOLTA"
+        linha = f"  ║  {icone}: {ESTACOES[org]} ➔ {ESTACOES[dst]} em {dt:%d/%m/%Y}"
+        print(c_str(f"{linha:<73}║", Cor.BRANCO, Cor.NEGRITO))
+
+    desc_classes = " + ".join(CLASSES[c] for c in classes)
+    print(c_str(f"  ║  💺 Classe(s)   : {desc_classes:<51}║", Cor.BRANCO))
+    print(c_str(f"  ║  👥 Passageiros : {qtd:<51}║", Cor.BRANCO))
+    print(c_str(f"  ║  ⏱️  Frequência  : A cada {INTERVALO_SEGUNDOS} segundos{' '*34}║", Cor.BRANCO))
+    print(c_str("  ╠══════════════════════════════════════════════════════════════════════╣", Cor.VERDE))
+    if tipo == 2:
+        print(c_str("  ║  🔔 Avisos: Vagas individuais emitem alerta e a busca continua;      ║", Cor.CINZA))
+        print(c_str("  ║             Ida e Volta simultâneas alertam e encerram a busca.       ║", Cor.CINZA))
+    else:
+        print(c_str("  ║  🔔 Avisos: Ao encontrar vagas para o trecho, a busca é encerrada.    ║", Cor.CINZA))
+    print(c_str("  ╚══════════════════════════════════════════════════════════════════════╝", Cor.VERDE, Cor.NEGRITO))
+
+
+def montar_trechos(sessao):
+    banner_principal()
+
     dados = {}
     etapa = 0
- 
+
     while True:
- 
-        # ETAPA 0 - TIPO DE VIAGEM (primeira etapa: nao ha para onde voltar)
+
+        # ETAPA 0 - TIPO DE VIAGEM
         if etapa == 0:
-            titulo_secao("TIPO DE VIAGEM")
-            print("  1) So ida")
-            print("  2) Ida e volta")
+            titulo_etapa(1, 6, "Tipo de Viagem")
+            print(c_str("  [1] 🎫 Somente Ida", Cor.BRANCO))
+            print(c_str("  [2] 🔄 Ida e Volta", Cor.BRANCO))
             tipo = pedir_inteiro("Escolha", 1, 2, permitir_voltar=False)
             dados["tipo"] = tipo
             if tipo == 1:
                 dados["d2"] = None
             etapa = 1
             continue
- 
+
         # ETAPA 1 - ORIGEM
         if etapa == 1:
             mostrar_selecao(dados)
-            origem = escolher_de_lista("ESTACAO DE ORIGEM (partida)", ESTACOES)
+            titulo_etapa(2, 6, "Estação de Origem (Partida)")
+            origem = escolher_estacao("Selecione de onde você partirá", ESTACOES)
             if origem is None:
                 etapa = 0
                 continue
@@ -335,22 +797,24 @@ def montar_trechos():
                 dados["destino"] = None
             etapa = 2
             continue
- 
+
         # ETAPA 2 - DESTINO
         if etapa == 2:
             mostrar_selecao(dados)
+            titulo_etapa(3, 6, "Estação de Destino (Chegada)")
             restantes = {k: v for k, v in ESTACOES.items() if k != dados["origem"]}
-            destino = escolher_de_lista("ESTACAO DE DESTINO (chegada)", restantes)
+            destino = escolher_estacao("Selecione para onde você viajará", restantes)
             if destino is None:
                 etapa = 1
                 continue
             dados["destino"] = destino
             etapa = 3
             continue
- 
+
         # ETAPA 3 - CLASSE
         if etapa == 3:
             mostrar_selecao(dados)
+            titulo_etapa(4, 6, "Classe Desejada")
             classes = escolher_classes()
             if classes is None:
                 etapa = 2
@@ -358,23 +822,24 @@ def montar_trechos():
             dados["classes"] = classes
             etapa = 4
             continue
- 
+
         # ETAPA 4 - PASSAGEIROS
         if etapa == 4:
             mostrar_selecao(dados)
-            titulo_secao("PASSAGEIROS")
-            qtd = pedir_inteiro("Numero de passageiros", 1, 8)
+            titulo_etapa(5, 6, "Quantidade de Passageiros")
+            qtd = pedir_inteiro("Número de assentos desejados", 1, MAX_PASSAGEIROS)
             if qtd is None:
                 etapa = 3
                 continue
             dados["qtd"] = qtd
             etapa = 5
             continue
- 
+
         # ETAPA 5 - DATA DA IDA
         if etapa == 5:
             mostrar_selecao(dados)
-            d1 = pedir_data("Data da IDA")
+            titulo_etapa(6, 6, "Data da Viagem")
+            d1 = pedir_data("Ida", sessao.datas)
             if d1 is None:
                 etapa = 4
                 continue
@@ -383,301 +848,376 @@ def montar_trechos():
                 dados["d2"] = None
             etapa = 6 if dados["tipo"] == 2 else 7
             continue
- 
+
         # ETAPA 6 - DATA DA VOLTA
         if etapa == 6:
             mostrar_selecao(dados)
-            d2 = pedir_data("Data da VOLTA", minimo=dados["d1"])
+            subtitulo("DATA DE RETORNO")
+            d2 = pedir_data("Volta", sessao.datas, minimo=dados["d1"])
             if d2 is None:
                 etapa = 5
                 continue
             dados["d2"] = d2
             etapa = 7
             continue
- 
-        # ETAPA 7 - RESUMO / CONFIRMACAO
+
+        # ETAPA 7 - CONFIRMAÇÃO
         if etapa == 7:
             o, d = dados["origem"], dados["destino"]
             trechos = [("IDA", o, d, dados["d1"])]
             if dados["tipo"] == 2:
                 trechos.append(("VOLTA", d, o, dados["d2"]))
- 
-            titulo_secao("RESUMO DA BUSCA")
-            for nome, org, dst, dt in trechos:
-                print(f"  {nome:<5}: {ESTACOES[org]} -> {ESTACOES[dst]}  em {dt:%d/%m/%Y}")
-            print(f"  Classe(s)  : {' + '.join(CLASSES[c] for c in dados['classes'])}")
-            print(f"  Passageiros: {dados['qtd']}")
-            print(f"  Frequencia : a cada {INTERVALO_SEGUNDOS}s")
-            if dados["tipo"] == 2:
-                print("  Avisos     : vagas individuais (ida OU volta) avisam e a busca continua;")
-                print("               ida E volta ao mesmo tempo avisam e encerram a busca.")
-            else:
-                print("  Avisos     : ao encontrar passagem a busca e encerrada.")
-            print(f"\n  ENTER = iniciar | {TECLA_VOLTAR} = voltar e corrigir | Ctrl+C = sair")
- 
-            confirmacao = input("> ").strip()
+
+            exibir_cartao_resumo(trechos, dados["classes"], dados["qtd"], dados["tipo"])
+
+            print(c_str(f"\n  [ENTER] ", Cor.VERDE, Cor.NEGRITO) + "Iniciar monitoramento contínuo")
+            print(c_str(f"  [{TECLA_VOLTAR}]     ", Cor.AMARELO, Cor.NEGRITO) + "Voltar e corrigir dados")
+            print(c_str(f"  [Ctrl+C] ", Cor.VERMELHO, Cor.NEGRITO) + "Sair do programa")
+
+            confirmacao = input(c_str("\n  Opção: ", Cor.CIANO, Cor.NEGRITO)).strip()
             if confirmacao.upper() == TECLA_VOLTAR:
                 etapa = 6 if dados["tipo"] == 2 else 5
                 continue
- 
+
             return trechos, dados["classes"], dados["qtd"], dados["tipo"]
- 
- 
+
+
 # ----------------------------------------------------------------------
-# ESTADO COMPARTILHADO DA BUSCA
+# CONSULTA DE ASSENTOS E DISPONIBILIDADE
 # ----------------------------------------------------------------------
-class Busca:
-    """Reune tudo que as threads precisam compartilhar."""
- 
-    def __init__(self, trechos, classes, qtd, tipo):
-        self.trechos = trechos
-        self.por_nome = {t[0]: t for t in trechos}
-        self.classes = classes
-        self.qtd = qtd
-        self.tipo = tipo
-        self.parar = threading.Event()   # sinaliza fim da busca a todas as threads
-        self.motivo = None               # "unica", "conjunto", "interrompida", ...
-        self.lock = threading.Lock()
-        # vagas atualmente disponiveis: (nome_trecho, classe) -> resumo
-        self.disponivel = {}
- 
- 
+def _get(d, *chaves):
+    for c in chaves:
+        if not isinstance(d, dict):
+            return None
+        d = d.get(c)
+    return d
+
+
+def assentos_da_viagem(sessao, viagem_id, origem, destino, qtd):
+    dados = sessao.chamar(
+        "GET", "/assentos/carros-ocupados",
+        params={
+            "idaOuVolta": "ida",
+            "viagemId": viagem_id,
+            "quantidadePassagens": qtd,
+            "estacaoOrigemId": origem,
+            "estacaoDestinoId": destino,
+            "tipoPassagemId": TIPO_PASSAGEM_NORMAL,
+        },
+    )
+    itens = dados if isinstance(dados, list) else [dados]
+    disp, resumo = {}, []
+    for item in itens:
+        if not isinstance(item, dict):
+            continue
+        if item.get("viagemId") not in (None, viagem_id):
+            continue
+        for carro in item.get("carros") or []:
+            cid = carro.get("classeId")
+            livres = carro.get("assentosDisponiveis") or 0
+            disp[cid] = disp.get(cid, 0) + livres
+            resumo.append((carro.get("carroPlaca"), cid, livres, carro.get("totalAssentos")))
+    return disp, resumo
+
+
+def consultar_trecho(sessao, trecho, qtd):
+    _, origem, destino, dt = trecho
+    dados = sessao.chamar(
+        "POST", "/viagens/buscar-viagens-disponiveis",
+        corpo={
+            "idaOuVolta": "ida",
+            "origemId": origem,
+            "destinoId": destino,
+            "data": dt.isoformat(),
+        },
+    )
+    conteudo = dados.get("content") if isinstance(dados, dict) else dados
+    viagens = []
+    for v in conteudo or []:
+        vid = v.get("id")
+        if vid is None:
+            continue
+        disp, carros = assentos_da_viagem(sessao, vid, origem, destino, qtd)
+        viagens.append({
+            "id": vid,
+            "trem": _get(v, "os", "prefixo", "prefixo") or "?",
+            "data": (v.get("data") or "").replace("-", "/"),
+            "partida": v.get("partida") or "--:--",
+            "chegada": v.get("chegada") or "--:--",
+            "disp": disp,
+            "carros": carros,
+        })
+        sessao.bombear(PAUSA_ENTRE_VIAGENS)
+    return viagens
+
+
+def linha_viagem(v, classe):
+    n = v["disp"].get(classe, 0)
+    return (
+        f"    🚂 Trem {v['trem']} ({v['data']}) | Partida: {v['partida']} ➔ Chegada: {v['chegada']} | "
+        f"{CLASSES[classe]}: {n} vaga(s) disponível(is)"
+    )
+
+
+def resumo_sem_vaga(viagens, classe, qtd):
+    if not viagens:
+        return "Sem viagens programadas"
+    maior = max(v["disp"].get(classe, 0) for v in viagens)
+    if maior == 0:
+        return f"{len(viagens)} viagem(ns) no dia, sem vagas livres"
+    return f"{len(viagens)} viagem(ns), máx {maior} vaga(s) encontrada(s) (necessário: {qtd})"
+
+
 # ----------------------------------------------------------------------
-# CONSULTA E AVISOS
+# ANÚNCIO DE VAGAS ENCONTRADAS
 # ----------------------------------------------------------------------
-def consultar(sessao, trecho, classe, qtd):
-    _, origem, destino, data_viagem = trecho
-    payload = montar_payload(origem, destino, data_viagem, classe, qtd)
-    resp = sessao.post(URL_DISPONIBILIDADE, json=payload, timeout=20)
-    resp.raise_for_status()
-    return resp.json()
- 
- 
-def bipar(repeticoes=3):
-    """Aviso sonoro suave: 3 toques espacados."""
-    for i in range(repeticoes):
-        if winsound:
-            try:
-                winsound.MessageBeep(winsound.MB_ICONASTERISK)
-            except Exception:
-                winsound.Beep(700, 200)
-        else:
-            print("\a", end="", flush=True)
-        if i < repeticoes - 1:
-            time.sleep(1.5)
- 
- 
-def anunciar(titulo, itens, qtd, rodape=None):
-    """itens: lista de (trecho, classe, resumo)."""
-    with PRINT_LOCK:
-        print()
-        print(LINHA_DUPLA)
-        print(f"  {titulo}")
-        print(LINHA_DUPLA)
-        for trecho, classe, resumo in itens:
-            nome, origem, destino, data_viagem = trecho
-            print(f"  {nome}: {ESTACOES[origem]} -> {ESTACOES[destino]}")
-            print(f"  Data: {data_viagem:%d/%m/%Y} | {CLASSES[classe]} | {qtd} passageiro(s)")
-            print(resumo)
-            print(LINHA_SIMPLES)
-        print(f"  Encontrada em {datetime.now():%d/%m/%Y as %H:%M:%S}")
-        if rodape:
-            print(f"  {rodape}")
-        print(f"  Compre em: {URL_COMPRA}")
-        print(LINHA_DUPLA)
-    bipar()
- 
- 
-def tratar_vaga(busca, trecho, classe, resumo):
-    """Registra a vaga e decide o que fazer:
-      - so ida: avisa e encerra a busca;
-      - ida e volta: se ha vaga nos dois trechos, avisa e encerra;
-        se e so um trecho (e e novidade), avisa e continua."""
-    nome = trecho[0]
-    acao = None
- 
-    with busca.lock:
-        if busca.parar.is_set():
-            return  # outra thread ja encerrou a busca
- 
-        novo = (nome, classe) not in busca.disponivel
-        busca.disponivel[(nome, classe)] = resumo
- 
-        if busca.tipo == 1:
-            acao = "unica"
-        else:
-            tem_ida = any(k[0] == "IDA" for k in busca.disponivel)
-            tem_volta = any(k[0] == "VOLTA" for k in busca.disponivel)
-            if tem_ida and tem_volta:
-                acao = "conjunto"
-            elif novo:
-                acao = "individual"
- 
-        if acao in ("unica", "conjunto"):
-            busca.motivo = acao
-            busca.parar.set()
-        snapshot = dict(busca.disponivel)
- 
-    if acao == "unica":
-        anunciar("PASSAGEM ENCONTRADA!", [(trecho, classe, resumo)], busca.qtd)
- 
-    elif acao == "conjunto":
-        itens = [(busca.por_nome[n], c, r) for (n, c), r in sorted(snapshot.items())]
-        anunciar("IDA E VOLTA DISPONIVEIS!", itens, busca.qtd)
- 
-    elif acao == "individual":
-        anunciar(
-            f"VAGA INDIVIDUAL ({nome}) - busca do conjunto continua",
-            [(trecho, classe, resumo)],
-            busca.qtd,
-            rodape=f"Ainda falta vaga na {'VOLTA' if nome == 'IDA' else 'IDA'} para fechar o conjunto.",
-        )
- 
- 
+def anunciar_vaga(sessao, titulo, itens, qtd, rodape=None):
+    print()
+    print(c_str("╔══════════════════════════════════════════════════════════════════════════╗", Cor.VERDE, Cor.NEGRITO))
+    print(c_str(f"║  🎉 🎉 🎉   {titulo.center(56)}   🎉 🎉 🎉  ║", Cor.VERDE, Cor.NEGRITO))
+    print(c_str("╠══════════════════════════════════════════════════════════════════════════╣", Cor.VERDE))
+    for trecho, classe, linhas in itens:
+        nome, origem, destino, data_viagem = trecho
+        print(c_str(f"║  📍 Trecho: {ESTACOES[origem]} ➔ {ESTACOES[destino]}", Cor.BRANCO, Cor.NEGRITO))
+        print(c_str(f"║  📅 Data  : {data_viagem:%d/%m/%Y} | {CLASSES[classe]} | {qtd} passageiro(s)", Cor.BRANCO))
+        print(c_str("║  " + "─" * 68, Cor.CINZA))
+        for linha in linhas:
+            print(c_str(f"║  {linha.strip()}", Cor.AMARELO, Cor.NEGRITO))
+        print(c_str("║  " + "─" * 68, Cor.CINZA))
+
+    print(c_str(f"║  🕒 Identificado em: {datetime.now():%d/%m/%Y às %H:%M:%S}", Cor.CINZA))
+    if rodape:
+        print(c_str(f"║  ⚠️  {rodape}", Cor.AMARELO))
+    print(c_str(f"║  🛒 Acesse IMEDIATAMENTE para comprar: {SITE}", Cor.CIANO, Cor.NEGRITO))
+    print(c_str("╚══════════════════════════════════════════════════════════════════════════╝", Cor.VERDE, Cor.NEGRITO))
+    apito_de_trem()
+
+
 # ----------------------------------------------------------------------
-# MONITORAMENTO DE UM TRECHO (roda em thread propria)
+# EXECUÇÃO DO MONITORAMENTO
 # ----------------------------------------------------------------------
-def monitorar_trecho(busca, trecho):
-    nome, o, d, dt = trecho
-    sessao = requests.Session()
-    sessao.headers.update(HEADERS)
- 
+def executar_busca(sessao, trechos, classes, qtd, tipo):
+    por_nome = {t[0]: t for t in trechos}
+    disponivel = {}
+
+    print()
+    print(c_str("╔══════════════════════════════════════════════════════════════════════════╗", Cor.CIANO, Cor.NEGRITO))
+    print(c_str("║ 🚂 MONITORAMENTO ATIVO - Pressione Ctrl+C a qualquer momento para pausar║", Cor.CIANO, Cor.NEGRITO))
+    print(c_str("╚══════════════════════════════════════════════════════════════════════════╝", Cor.CIANO, Cor.NEGRITO))
+
+    for nome, o, d, dt in trechos:
+        print(c_str(f"  • {nome:<5}: {ESTACOES[o]} ➔ {ESTACOES[d]} em {dt:%d/%m/%Y}", Cor.BRANCO))
+    print(c_str("─" * LARGURA, Cor.CINZA))
+    print(c_str("  Hora      Ciclo   Trecho   Data    Classe     │ Situação", Cor.CINZA))
+    print(c_str("─" * LARGURA, Cor.CINZA))
+
+    def tratar_vaga(trecho, classe, linhas):
+        nome = trecho[0]
+        novo = (nome, classe) not in disponivel
+        disponivel[(nome, classe)] = linhas
+
+        if tipo == 1:
+            anunciar_vaga(sessao, "PASSAGEM ENCONTRADA!", [(trecho, classe, linhas)], qtd)
+            return "unica"
+
+        tem_ida = any(k[0] == "IDA" for k in disponivel)
+        tem_volta = any(k[0] == "VOLTA" for k in disponivel)
+        if tem_ida and tem_volta:
+            itens = [(por_nome[n], c, l) for (n, c), l in sorted(disponivel.items())]
+            anunciar_vaga(sessao, "IDA E VOLTA DISPONÍVEIS!", itens, qtd)
+            return "conjunto"
+
+        if novo:
+            faltando = "VOLTA" if nome == "IDA" else "IDA"
+            anunciar_vaga(
+                sessao,
+                f"VAGA INDIVIDUAL ({nome})",
+                [(trecho, classe, linhas)],
+                qtd,
+                rodape=f"Ainda monitorando a {faltando} para fechar o conjunto de ida e volta.",
+            )
+        return None
+
+    ciclo = 0
     espera = INTERVALO_SEGUNDOS
-    tentativa = 0
- 
-    while not busca.parar.is_set():
-        tentativa += 1
-        falhou = False
- 
-        for classe in busca.classes:
-            if busca.parar.is_set():
-                return
- 
-            agora = datetime.now().strftime("%H:%M:%S")
-            prefixo = f"[{agora}] #{tentativa:<3} {nome:<5} {dt:%d/%m} {CLASSES[classe]:<10} |"
- 
-            try:
-                dados = consultar(sessao, trecho, classe, busca.qtd)
- 
-            except requests.HTTPError as e:
-                falhou = True
-                log(f"{prefixo} erro HTTP {e.response.status_code}")
-                busca.parar.wait(PAUSA_ENTRE_CONSULTAS)
-                continue
- 
-            except (requests.RequestException, ValueError) as e:
-                falhou = True
-                log(f"{prefixo} erro de rede/JSON: {e}")
-                busca.parar.wait(PAUSA_ENTRE_CONSULTAS)
-                continue
- 
-            if MODO_DIAGNOSTICO:
-                with PRINT_LOCK:
-                    print("\n=== RESPOSTA COMPLETA ===")
-                    print(json.dumps(dados, indent=2, ensure_ascii=False))
-                    print("=== FIM ===")
-                    print("Modo diagnostico: encerrando apos uma consulta.")
-                with busca.lock:
-                    busca.motivo = "diagnostico"
-                    busca.parar.set()
-                return
- 
-            tem_vaga, resumo = interpretar_resposta(dados, busca.qtd, o, d, classe)
- 
-            if tem_vaga:
-                log(f"{prefixo} >>> VAGA ENCONTRADA <<<")
-                tratar_vaga(busca, trecho, classe, resumo)
-                if busca.parar.is_set():
-                    return
-            else:
-                # se havia vaga antes e sumiu, deixa de contar para o conjunto
-                with busca.lock:
-                    busca.disponivel.pop((nome, classe), None)
-                log(f"{prefixo} {resumo}")
- 
-            busca.parar.wait(PAUSA_ENTRE_CONSULTAS)
- 
-        if falhou:
-            espera = min(espera * 2, BACKOFF_MAXIMO)
-            log(f"[{datetime.now():%H:%M:%S}]       {nome:<5} servidor instavel: aguardando {espera}s")
-        else:
-            espera = INTERVALO_SEGUNDOS
- 
-        busca.parar.wait(espera)  # acorda na hora se a busca for encerrada
- 
- 
-# ----------------------------------------------------------------------
-# ORQUESTRACAO
-# ----------------------------------------------------------------------
-def iniciar_monitoramento(busca):
-    """Roda as threads e so retorna quando a busca terminar
-    (vaga encontrada ou Ctrl+C)."""
- 
-    titulo_secao("BUSCA EM ANDAMENTO (Ctrl+C para interromper)")
-    for nome, o, d, dt in busca.trechos:
-        print(f"  {nome:<5}: {ESTACOES[o]} -> {ESTACOES[d]}  em {dt:%d/%m/%Y}")
-    print(LINHA_SIMPLES)
-    print("  Hora      Ciclo Trecho Data  Classe     | Situacao")
-    print(LINHA_SIMPLES)
- 
-    threads = [
-        threading.Thread(
-            target=monitorar_trecho,
-            args=(busca, trecho),
-            name=f"Monitor-{trecho[0]}",
-            daemon=True,
-        )
-        for trecho in busca.trechos
-    ]
-    for t in threads:
-        t.start()
- 
-    try:
-        while not busca.parar.wait(0.5):
-            pass
-    except KeyboardInterrupt:
-        with busca.lock:
-            if busca.motivo is None:
-                busca.motivo = "interrompida"
-            busca.parar.set()
-        print("\nInterrompendo busca...")
- 
-    for t in threads:
-        t.join(timeout=25)
- 
-    mensagens = {
-        "unica": "passagem encontrada.",
-        "conjunto": "ida e volta encontradas.",
-        "interrompida": "interrompida por voce.",
-        "diagnostico": "modo diagnostico concluido.",
-    }
-    print(f"\nBusca encerrada: {mensagens.get(busca.motivo, 'fim da busca.')}")
- 
- 
-def perguntar_nova_busca():
-    while True:
-        r = input("\nDeseja fazer uma nova busca? (S = nova busca / N = encerrar programa): ").strip().upper()
-        if r in ("S", "SIM"):
-            return True
-        if r in ("N", "NAO"):
-            return False
-        print("Responda S ou N.")
- 
- 
-def main():
+
     try:
         while True:
-            trechos, classes, qtd, tipo = montar_trechos()
-            busca = Busca(trechos, classes, qtd, tipo)
-            iniciar_monitoramento(busca)
- 
-            if not perguntar_nova_busca():
-                break
+            ciclo += 1
+            falhou = False
+
+            for trecho in trechos:
+                nome, o, d, dt = trecho
+                try:
+                    viagens = consultar_trecho(sessao, trecho, qtd)
+                except ErroApi as e:
+                    falhou = True
+                    log(c_str(f"  [{hora()}] #{ciclo:03d}   {nome:<6}  {dt:%d/%m}   Erro: {e}", Cor.VERMELHO))
+                    sessao.bombear(PAUSA_ENTRE_CONSULTAS)
+                    continue
+
+                if MODO_DIAGNOSTICO:
+                    print("\n=== DIAGNÓSTICO ===")
+                    for v in viagens:
+                        print(f"Viagem {v['id']} - trem {v['trem']} {v['data']} {v['partida']} -> {v['chegada']}")
+                        for placa, cid, livres, total in v["carros"]:
+                            print(f"   carro {placa}: {CLASSES.get(cid, cid)} {livres}/{total} livres")
+                    print("=== FIM DIAGNÓSTICO ===")
+                    return "diagnostico"
+
+                for classe in classes:
+                    prefixo = f"  [{hora()}] #{ciclo:03d}   {nome:<6}  {dt:%d/%m}   {CLASSES[classe]:<10} │"
+                    achadas = [v for v in viagens if v["disp"].get(classe, 0) >= qtd]
+
+                    if achadas:
+                        log(c_str(f"{prefixo} 🟢 >>> VAGA ENCONTRADA! <<<", Cor.VERDE, Cor.NEGRITO))
+                        linhas = [linha_viagem(v, classe) for v in achadas]
+                        motivo = tratar_vaga(trecho, classe, linhas)
+                        if motivo:
+                            return motivo
+                    else:
+                        disponivel.pop((nome, classe), None)
+                        msg_vaga = resumo_sem_vaga(viagens, classe, qtd)
+                        log(c_str(f"{prefixo} ⏳ {msg_vaga}", Cor.CINZA))
+
+                sessao.bombear(PAUSA_ENTRE_CONSULTAS)
+
+            if falhou:
+                espera = min(espera * 2, BACKOFF_MAXIMO)
+                log(c_str(f"  [{hora()}]       ⚠️  Conexão oscilando: aguardando {espera}s...", Cor.AMARELO))
+            else:
+                espera = INTERVALO_SEGUNDOS
+
+            sessao.bombear(espera)
+
     except KeyboardInterrupt:
-        print()
- 
-    print("\nPrograma encerrado.")
- 
- 
+        print(c_str("\n\n  🛑 Monitoramento interrompido pelo usuário.", Cor.AMARELO, Cor.NEGRITO))
+        return "interrompida"
+
+
+def perguntar_nova_busca():
+    while True:
+        r = input(c_str("\n  Deseja realizar uma nova pesquisa? [S = Sim / N = Encerrar]: ", Cor.CIANO, Cor.NEGRITO)).strip().upper()
+        if r in ("S", "SIM"):
+            return True
+        if r in ("N", "NAO", "NÃO"):
+            return False
+        print(c_str("  [!] Por favor, responda com S ou N.", Cor.VERMELHO))
+
+
+# ----------------------------------------------------------------------
+# CONTROLE DE JANELA EXTERNA (CMD DEDICADO)
+# ----------------------------------------------------------------------
+FLAG_JANELA_CMD = "--janela-cmd"
+ENV_JANELA_CMD = "EFVM_NOVA_JANELA"
+
+
+def garantir_janela_cmd():
+    """
+    Garante que o script sempre rode em uma nova janela independente do Prompt
+    de Comando (CMD), liberando o terminal do VSCode ou de qualquer outro ambiente.
+    Caso o usuário deseje forçar a execução no terminal atual, basta passar --aqui.
+    """
+    if sys.platform != "win32":
+        return
+
+    if FLAG_JANELA_CMD in sys.argv:
+        sys.argv.remove(FLAG_JANELA_CMD)
+        return
+
+    if "--aqui" in sys.argv or "--no-new-window" in sys.argv:
+        if "--aqui" in sys.argv:
+            sys.argv.remove("--aqui")
+        if "--no-new-window" in sys.argv:
+            sys.argv.remove("--no-new-window")
+        return
+
+    if os.environ.get(ENV_JANELA_CMD) == "1":
+        return
+
+    script_path = os.path.abspath(__file__)
+    script_dir = os.path.dirname(script_path)
+    python_exe = sys.executable
+
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    env[ENV_JANELA_CMD] = "1"
+
+    subprocess.Popen(
+        [python_exe, "-u", script_path, FLAG_JANELA_CMD],
+        creationflags=subprocess.CREATE_NEW_CONSOLE,
+        cwd=script_dir,
+        env=env,
+    )
+
+    print("\n" + "═" * 70)
+    print("  🚂 EFVM TICKET MONITOR")
+    print("═" * 70)
+    print("  [+] Abrindo uma nova janela externa do Prompt de Comando (CMD)...")
+    print("  [+] O monitor será executado na nova janela.")
+    print("  [+] Você já pode fechar ou minimizar este terminal do VSCode.")
+    print("═" * 70 + "\n")
+    time.sleep(1)
+    sys.exit(0)
+
+
+# ----------------------------------------------------------------------
+# PONTO DE ENTRADA PRINCIPAL
+# ----------------------------------------------------------------------
+def main():
+    desabilitar_quickedit()
+
+    mensagens = {
+        "unica": "Passagem individual encontrada!",
+        "conjunto": "Ida e Volta encontradas com sucesso!",
+        "interrompida": "Interrompida pelo usuário.",
+        "diagnostico": "Modo diagnóstico concluído.",
+    }
+
+    if PERFIL_ANTIGO.exists():
+        shutil.rmtree(PERFIL_ANTIGO, ignore_errors=True)
+        if not PERFIL_ANTIGO.exists():
+            log("Limpeza: pasta legada 'perfil_vale' removida com sucesso.")
+
+    with sync_playwright() as pw:
+        sessao = Sessao(pw)
+        try:
+            # 1. Abre a página da Vale para login no navegador e fecha a janela automaticamente
+            sessao.login_visual_automatico()
+
+            # 2. Carrega catálogo de estações e datas
+            sessao.carregar_dados_site()
+
+            # 3. Ciclo de configuração e busca
+            while True:
+                trechos, classes, qtd, tipo = montar_trechos(sessao)
+                motivo = executar_busca(sessao, trechos, classes, qtd, tipo)
+                print(c_str(f"\n  Finalizado: {mensagens.get(motivo, 'Fim do ciclo.')}", Cor.BRANCO, Cor.NEGRITO))
+
+                if not perguntar_nova_busca():
+                    break
+
+        except KeyboardInterrupt:
+            print()
+        except PlaywrightError as e:
+            print(c_str(f"\n[!] A janela do navegador reportou erro: {str(e).splitlines()[0]}", Cor.VERMELHO))
+        finally:
+            sessao.fechar()
+
+    print(c_str("\n  🚂 Obrigado por usar o Monitor EFVM! Boa viagem!\n", Cor.CIANO, Cor.NEGRITO))
+
+
 if __name__ == "__main__":
-    main()
+    garantir_janela_cmd()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nPrograma interrompido.")
+    except Exception as e:
+        print(f"\n[!] Erro inesperado: {e}")
+    finally:
+        if sys.platform == "win32":
+            try:
+                input("\nPressione ENTER para fechar esta janela...")
+            except Exception:
+                pass
